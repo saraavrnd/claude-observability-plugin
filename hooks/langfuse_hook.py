@@ -446,6 +446,283 @@ def trace_attribute_kwargs() -> Dict[str, Any]:
     return kwargs
 
 
+# ----------------- Vendor pricing rules (BheemBhai patch) -----------------
+# A vendor's price tiers (DeepSeek's off-peak hours, say) are rule DATA: the
+# BheemBhai platform freezes them per run and the engine hands them to this hook
+# as JSON in CC_LANGFUSE_PRICING_RULES. One generic evaluator per rule "kind"
+# turns the fixed facts of one model call into one label, stamped into that
+# generation's observation metadata; the Langfuse model definition maps the
+# label onto a price. This hook never learns a vendor's name and never computes
+# a price.
+#
+# Deliberately stdlib-only and Python 3.9-parseable: it sits above the SDK
+# import guard, which must be able to log even when the SDK cannot load. It
+# mirrors shared/bheembhai/pricing_rules.py (same test vectors). A rule that
+# cannot be evaluated is SKIPPED — never half-labelled; its key stays absent and
+# Langfuse applies the model's default tier — and the reason is appended to the
+# report file the BheemBhai runner folds into the step result.
+
+#: The run's AI-vendor provider key — one of the evaluator's context facts, and
+#: the same value the engine resolved the rules with. "" when none was named.
+PRICING_PROVIDER = _opt("BB_LLM_PROVIDER")
+PRICING_RULES_VERSION = _opt("CC_LANGFUSE_PRICING_RULES_VERSION")
+
+#: Where this invocation's evaluation record is appended (engine-composed,
+#: container-local). Empty = nobody is reading, so nothing is written.
+PRICING_REPORT_FILE = _opt("CC_LANGFUSE_PRICING_REPORT_FILE")
+
+#: This invocation's pricing activity: how many generations were stamped and
+#: every rule that could not be evaluated. ``errors`` is the ONLY error channel
+#: — an evaluation failure never breaks emission — and it rides the report file
+#: out of the container because a log line reaches nobody who can act on it.
+_PRICING_REPORT: Dict[str, Any] = {"evaluated": 0, "errors": []}
+
+
+def parse_pricing_rules(raw: str) -> List[Dict[str, Any]]:
+    """Parse the frozen rules array; unusable input is logged and dropped.
+
+    Dropping is the fail-safe direction: with no rules this hook stamps no
+    pricing key at all and Langfuse prices the generation at its own default
+    tier — which ADR-029 requires to be the vendor's most expensive label, so a
+    dropped rule set overestimates rather than under-charges.
+    """
+    text = (raw or "").strip()
+    if not text:
+        return []
+    try:
+        parsed = json.loads(text)
+    except ValueError:
+        info("CC_LANGFUSE_PRICING_RULES is not valid JSON; no pricing labels")
+        return []
+    if not isinstance(parsed, list):
+        info("CC_LANGFUSE_PRICING_RULES is not a JSON array; no pricing labels")
+        return []
+    rules = [rule for rule in parsed if isinstance(rule, dict)]
+    if len(rules) != len(parsed):
+        info(f"CC_LANGFUSE_PRICING_RULES: {len(parsed) - len(rules)} non-object entries ignored")
+    return rules
+
+
+PRICING_RULES = parse_pricing_rules(_opt("CC_LANGFUSE_PRICING_RULES"))
+
+
+def _pricing_note_error(message: str) -> None:
+    """Record one refused rule: logged here, reported to BheemBhai at exit."""
+    info(f"pricing: {message}")
+    _PRICING_REPORT["errors"].append(message)
+
+
+def _pricing_is_label(value: Any) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _pricing_required_label(mapping: Dict[str, Any], field: str, where: str = "rule") -> str:
+    value = mapping.get(field)
+    if not _pricing_is_label(value):
+        raise ValueError(f"{where}: '{field}' must be a non-empty label")
+    return value
+
+
+def _pricing_parse_time(value: Any, allow_end_of_day: bool = False) -> Optional[int]:
+    """``HH:MM`` -> minutes since midnight; ``"24:00"`` -> 1440 when allowed."""
+    if not isinstance(value, str):
+        return None
+    if allow_end_of_day and value == "24:00":
+        return 24 * 60
+    if not re.match(r"^([01]\d|2[0-3]):[0-5]\d$", value):
+        return None
+    hours, minutes = value.split(":")
+    return int(hours) * 60 + int(minutes)
+
+
+def _pricing_local_time(timestamp: Any, tz: Any) -> Optional[datetime]:
+    """Parse an ISO-8601 timestamp into *tz*; None when unusable.
+
+    A naive timestamp (no offset) is read as UTC: the contract's timestamps are
+    UTC-anchored (the CLI writes ISO-8601 with a ``Z``), and reading an
+    offsetless one in the container's local zone would be silently wrong.
+    """
+    if not isinstance(timestamp, str) or not timestamp.strip():
+        return None
+    text = timestamp.strip()
+    if text.endswith(("Z", "z")):
+        text = text[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(tz)
+
+
+def _pricing_zone(name: Any) -> Any:
+    """Resolve a timezone name, or refuse the rule.
+
+    ``zoneinfo`` reads the system tz database. A container without one fails
+    HERE — loudly, per rule — which is the correct fail-safe (the rule is
+    skipped, the default tier applies) but invisible unless the reason reaches
+    the report, which is exactly why it is raised rather than guessed at.
+    """
+    from zoneinfo import ZoneInfo  # function-local: this section stays import-light
+
+    if not isinstance(name, str) or not name:
+        raise ValueError(f"unknown timezone {name!r}")
+    try:
+        return ZoneInfo(name)
+    except Exception as exc:
+        raise ValueError(f"unknown timezone {name!r}") from exc
+
+
+def _pricing_eval_time_window(rule: Dict[str, Any], context: Dict[str, Any]) -> str:
+    """One label from the call's own wall-clock time in the rule's timezone.
+
+    Order: the whole-day ``date_overrides`` entry first, then the first window
+    whose ``days`` and ``[from, to)`` contain the local time, else ``default``.
+    A window never wraps midnight (``to`` must be later than ``from``);
+    ``"24:00"`` means end of day. A missing or unparseable timestamp is NOT an
+    error — it is the fallback, the honest overestimate.
+    """
+    default = _pricing_required_label(rule, "default")
+    tz = _pricing_zone(rule.get("tz") or "UTC")
+    windows = rule.get("windows")
+    if not isinstance(windows, list) or not windows:
+        raise ValueError("'windows' must be a non-empty array")
+    overrides = rule.get("date_overrides") or {}
+    if not isinstance(overrides, dict):
+        raise TypeError("'date_overrides' must be an object")
+
+    local = _pricing_local_time(context.get("timestamp"), tz)
+    if local is None:
+        return default
+
+    override = overrides.get(local.strftime("%Y-%m-%d"))
+    if _pricing_is_label(override):
+        return override
+
+    minutes = local.hour * 60 + local.minute
+    weekday = local.weekday()  # Monday = 0
+    for j, window in enumerate(windows, start=1):
+        if not isinstance(window, dict):
+            raise TypeError(f"window {j} must be an object")
+        days = window.get("days")
+        if not isinstance(days, list) or any(
+            not isinstance(d, int) or isinstance(d, bool) for d in days
+        ):
+            raise ValueError(f"window {j}: 'days' must be an array of weekday numbers")
+        if weekday not in days:
+            continue
+        frm = _pricing_parse_time(window.get("from"))
+        to = _pricing_parse_time(window.get("to"), allow_end_of_day=True)
+        if frm is None or to is None or to <= frm:
+            raise ValueError(
+                f"window {j}: bad from/to ({window.get('from')!r}-{window.get('to')!r})"
+            )
+        if frm <= minutes < to:
+            return _pricing_required_label(window, "label", where=f"window {j}")
+    return default
+
+
+#: One handler per kind the platform can ship. A rule naming anything else is
+#: skipped (logged + reported) and its key stays absent from the generation.
+_PRICING_HANDLERS: Dict[str, Any] = {
+    "time_window": _pricing_eval_time_window,
+}
+
+
+def evaluate_pricing_rule(rule: Any, context: Dict[str, Any]) -> str:
+    """Evaluate ONE rule against *context*; returns its label.
+
+    Raises on an unknown kind or malformed rule data — the caller records the
+    reason and skips the rule's key.
+    """
+    if not isinstance(rule, dict):
+        raise TypeError(f"rule must be an object, got {type(rule).__name__}")
+    kind = rule.get("kind")
+    handler = _PRICING_HANDLERS.get(kind)
+    if handler is None:
+        raise ValueError(
+            f"unknown kind {kind!r} (supported: {', '.join(sorted(_PRICING_HANDLERS))})"
+        )
+    return handler(rule, context)
+
+
+def evaluate_pricing_rules(rules: Any, context: Dict[str, Any]) -> Dict[str, str]:
+    """Evaluate every rule; returns ``{key: label}``.
+
+    A rule that raises is skipped with its error recorded — never a partial
+    label. Two rules may target two different keys (one model call can be
+    priced on more than one axis).
+    """
+    labels: Dict[str, str] = {}
+    if not isinstance(rules, list):
+        return labels
+    for i, rule in enumerate(rules):
+        kind = rule.get("kind") if isinstance(rule, dict) else type(rule).__name__
+        try:
+            labels[rule["key"]] = evaluate_pricing_rule(rule, context)
+        except Exception as exc:  # noqa: BLE001 — the report IS the error channel
+            _pricing_note_error(f"rule {i + 1} ({kind}): {exc}")
+    return labels
+
+
+def stamp_pricing_metadata(assistant_message: Dict[str, Any], metadata: Dict[str, Any]) -> None:
+    """Stamp one generation's pricing label(s) onto *metadata*, in place.
+
+    Called for every assistant message the hook walks, so a subagent's own
+    generations are priced by the same rules as the main loop's. The context is
+    the fixed, provider-independent record ADR-029 pins — ``{model, timestamp,
+    provider, env, metadata}`` — read off this call's own facts: a kind may read
+    it and must never branch on the provider's identity. With no rules, nothing
+    is written at all: the generation carries no pricing key and Langfuse prices
+    it at the model's default tier.
+    """
+    if not PRICING_RULES:
+        return
+    timestamp = parse_timestamp(assistant_message)
+    context = {
+        "model": get_model(assistant_message),
+        "timestamp": timestamp.isoformat() if timestamp is not None else None,
+        "provider": PRICING_PROVIDER,
+        # `env`/`metadata` are deliberate empty bags: the contract carries them
+        # for kinds that need more than the call's own facts, and forwarding the
+        # process environment would put credentials one rule bug away from an
+        # observation field. A kind that needs a fact gets a named projection
+        # here, reviewed on its own.
+        "env": {},
+        "metadata": {},
+    }
+    labels = evaluate_pricing_rules(PRICING_RULES, context)
+    _PRICING_REPORT["evaluated"] += 1
+    metadata.update(labels)
+
+
+def write_pricing_report() -> None:
+    """Append this invocation's evaluation record for the BheemBhai runner.
+
+    One JSON line per hook invocation, written only when rules were actually
+    evaluated: with no rules there is no file at all, because ABSENCE is how the
+    engine knows nobody looked (it must never read a silent step as a cleared
+    problem). Appended, never rewritten — the hook runs many times per session,
+    and a truncating write would let the last invocation erase the errors of the
+    ones before it. Never raises: telemetry is best-effort.
+    """
+    if not PRICING_RULES or not PRICING_REPORT_FILE:
+        return
+    if not _PRICING_REPORT["evaluated"] and not _PRICING_REPORT["errors"]:
+        return
+    record = {
+        "provider": PRICING_PROVIDER or None,
+        "rules_version": PRICING_RULES_VERSION or None,
+        "evaluated": _PRICING_REPORT["evaluated"],
+        "errors": _PRICING_REPORT["errors"],
+    }
+    try:
+        with open(PRICING_REPORT_FILE, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, separators=(",", ":")) + "\n")
+    except Exception as exc:
+        debug(f"pricing report not written to {PRICING_REPORT_FILE}: {exc}")
+
 
 # ----------------- Langfuse import (fail-open) -----------------
 # Everything above this guard runs before the SDK import and must stay
@@ -2749,6 +3026,9 @@ def build_generation_kwargs(
         generation_kwargs["metadata"]["thinking"] = thinking_metas
     if speed is not None:
         generation_kwargs["metadata"]["speed"] = speed
+    # BheemBhai patch: label THIS generation from its own model + timestamp,
+    # using the run's frozen vendor pricing rules (ADR-029). No rules -> no key.
+    stamp_pricing_metadata(assistant_message, generation_kwargs["metadata"])
     usage_details = get_usage_details_from_row(assistant_message)
     if usage_details is not None:
         generation_kwargs["usage_details"] = usage_details
@@ -3670,6 +3950,10 @@ def main() -> int:
         return 0
 
     finally:
+        # BheemBhai patch: hand this invocation's pricing activity to the
+        # runner (one JSON line, only when rules were evaluated). Outside the
+        # Langfuse shutdown so a reporting problem cannot hold up the flush.
+        write_pricing_report()
         flush_and_shutdown_langfuse_client(langfuse)
 
 if __name__ == "__main__":
