@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import random
+import re
 import sys
 import threading
 import time
@@ -45,6 +46,12 @@ try:
     MAX_CHARS = int(_opt("CC_LANGFUSE_MAX_CHARS") or "20000")
 except ValueError:
     MAX_CHARS = 20000
+
+# Trace-level overrides for the launching application (BheemBhai): the engine
+# names each skill step's trace and stamps its version. Unset elsewhere, which
+# keeps the upstream defaults.
+TRACE_NAME_OVERRIDE = _opt("CC_LANGFUSE_TRACE_NAME")
+TRACE_VERSION = _opt("CC_LANGFUSE_TRACE_VERSION")
 
 MAX_OPERATOR_TAGS = 20
 MAX_OPERATOR_TAG_CHARS = 200
@@ -99,6 +106,66 @@ def parse_operator_tags(raw: str) -> Tuple[List[str], str]:
     return tags, warning
 
 OPERATOR_TAGS, _OPERATOR_TAGS_WARNING = parse_operator_tags(_opt(OPERATOR_TAGS_VAR))
+
+
+# ----------------- Secret masking -----------------
+# Upstream has no masking, and its truncation funnel only inspects STRING tool
+# inputs — a dict-shaped payload (Write file content, Edit strings, env dumps)
+# reaches the trace raw. An agent reading a .env file or echoing a credential
+# is a real vector, so masking runs inside the funnel itself AND on the
+# dict-shaped input path, before any length or digest is computed.
+_SECRET_PATTERNS: Tuple[Tuple["re.Pattern[str]", str], ...] = (
+    # PEM blocks span lines.
+    (re.compile(
+        r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----",
+        re.DOTALL,
+    ), "[REDACTED:private-key]"),
+    # Presigned-URL credentials (S3 upload/download links ride the context).
+    (re.compile(r"(?:X-Amz-(?:Signature|Security-Token|Credential)=)[^&\s\"'\\]+"), "[REDACTED:presigned-url]"),
+    # VAR=value assignments — the .env file / `env` output vector. The NAME and
+    # the operator are kept (group 1), so the trace still shows which
+    # credential was in play.
+    (re.compile(
+        r"\b((?:ANTHROPIC_API_KEY|ANTHROPIC_AUTH_TOKEN|LANGFUSE_SECRET_KEY|LANGFUSE_PUBLIC_KEY"
+        r"|JIRA_API_TOKEN|ATLASSIAN_API_TOKEN|GITHUB_PERSONAL_ACCESS_TOKEN|GH_TOKEN|BB_GIT_TOKEN"
+        r"|AWS_SECRET_ACCESS_KEY|AWS_SESSION_TOKEN)\s*[=:]\s*[\"']?)[A-Za-z0-9_\-./+=]{8,}"
+    ), r"\g<1>[REDACTED:env-assignment]"),
+    # Vendor-prefixed token shapes: specific prefixes before the generic sk-.
+    (re.compile(r"\b(?:sk|pk)-lf-[A-Za-z0-9\-]{8,}"), "[REDACTED:langfuse-key]"),
+    (re.compile(r"\bsk-ant-[A-Za-z0-9\-_]{8,}"), "[REDACTED:anthropic-key]"),
+    (re.compile(r"\bsk-[A-Za-z0-9]{20,}"), "[REDACTED:api-key]"),
+    (re.compile(r"\bgh[pousr]_[A-Za-z0-9]{36,}"), "[REDACTED:github-token]"),
+    (re.compile(r"\bgithub_pat_[A-Za-z0-9_]{22,}"), "[REDACTED:github-pat]"),
+    (re.compile(r"\bATATT[A-Za-z0-9_\-=]{16,}"), "[REDACTED:atlassian-token]"),
+    (re.compile(r"\bAKIA[0-9A-Z]{16}\b"), "[REDACTED:aws-access-key-id]"),
+)
+
+
+def mask_secrets(text: str) -> str:
+    """Replace recognized credentials with ``[REDACTED:<kind>]``.
+
+    Idempotent: a marker never matches a pattern, so masking at more than one
+    seam (as this hook does) cannot double-replace. Only recognizable secret
+    SHAPES are touched; analysis text passes through unchanged.
+    """
+    if not text:
+        return text
+    for pattern, replacement in _SECRET_PATTERNS:
+        text = pattern.sub(replacement, text)
+    return text
+
+
+def mask_secrets_in_value(value: Any) -> Any:
+    """Deep-mask every string inside a JSON-shaped value (dict/list/scalar)."""
+    if isinstance(value, str):
+        return mask_secrets(value)
+    if isinstance(value, dict):
+        return {key: mask_secrets_in_value(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [mask_secrets_in_value(item) for item in value]
+    return value
+
+
 
 
 # ----------------- Paths -----------------
@@ -341,6 +408,43 @@ def info(msg: str) -> None:
             lg.info(msg)
         except Exception:
             pass
+
+
+def parse_trace_metadata(raw: str) -> Optional[Dict[str, Any]]:
+    """Parse lineage metadata from a JSON object; bad input yields None.
+
+    Telemetry stays best-effort: malformed input is logged and dropped, never
+    an exception.
+    """
+    raw = (raw or "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except ValueError:
+        info("CC_LANGFUSE_TRACE_METADATA: ignored, not valid JSON")
+        return None
+    if not isinstance(parsed, dict):
+        info("CC_LANGFUSE_TRACE_METADATA: ignored, JSON is not an object")
+        return None
+    return parsed
+
+TRACE_METADATA = parse_trace_metadata(_opt("CC_LANGFUSE_TRACE_METADATA"))
+
+
+def trace_attribute_kwargs() -> Dict[str, Any]:
+    """Trace-level attribute overrides for the launching application's trace.
+
+    BheemBhai's engine sets these per skill step; unset they keep the upstream
+    defaults (the shared trace name, no version, no metadata).
+    """
+    kwargs: Dict[str, Any] = {"trace_name": TRACE_NAME_OVERRIDE or TRACE_NAME}
+    if TRACE_VERSION:
+        kwargs["version"] = TRACE_VERSION
+    if TRACE_METADATA:
+        kwargs["metadata"] = TRACE_METADATA
+    return kwargs
+
 
 
 # ----------------- Langfuse import (fail-open) -----------------
@@ -787,6 +891,9 @@ def extract_text_from_content(content: Any) -> str:
 def truncate_text(s: str, max_chars: int = MAX_CHARS) -> Tuple[str, Dict[str, Any]]:
     if s is None:
         return "", {"truncated": False, "orig_len": 0}
+    # Mask BEFORE measuring: the lengths and the sha256 digest must describe
+    # the masked payload — a digest of a raw secret is itself a leak vector.
+    s = mask_secrets(s)
     orig_len = len(s)
     if orig_len <= max_chars:
         return s, {"truncated": False, "orig_len": orig_len}
@@ -802,7 +909,7 @@ def build_status_message(value: Any, fallback: str) -> str:
         except (TypeError, ValueError):
             text = str(value)
         text = text.strip()
-    return text or fallback
+    return mask_secrets(text or fallback)
 
 def is_interrupted_turn_row(row: Dict[str, Any]) -> bool:
     """Report the marker row that ends a turn the user stopped.
@@ -2029,7 +2136,8 @@ def collect_subagent_skill_tags(
                 add_skill_tags_from_rows(rows, names, "subagent-skill:")
     return names
 
-# Constant on purpose: a shared trace name keeps Langfuse name-based grouping usable.
+# Constant on purpose: a shared trace name keeps Langfuse name-based grouping
+# usable. The launching application may override it (CC_LANGFUSE_TRACE_NAME).
 TRACE_NAME = "Claude Code Turn"
 
 def get_trace_tags(
@@ -2218,7 +2326,9 @@ def get_tool_input_for_observation(tool_use: Dict[str, Any]) -> Tuple[Any, Optio
     )
     if isinstance(tool_input_raw, str):
         return truncate_text(tool_input_raw)
-    return tool_input_raw, None
+    # Dict/list payloads bypass the truncation funnel entirely, so they are
+    # deep-masked here (Write file content, Edit strings, commands).
+    return mask_secrets_in_value(tool_input_raw), None
 
 def render_tool_result_content(raw: Any) -> Tuple[Any, Optional[Dict[str, Any]]]:
     """Serialize a tool_result content value for an observation payload.
@@ -3220,8 +3330,8 @@ def emit_turn(langfuse: Langfuse, session_id: str, turn_num: int,
         attribute_propagation = propagate_attributes(
             session_id=session_id,
             user_id=user_id,
-            trace_name=TRACE_NAME,
             tags=get_trace_tags(turn, subagent_transcripts_by_tool_use_id),
+            **trace_attribute_kwargs(),
         )
     else:
         # Attached mode: trace name, session, user and tags are trace-level
