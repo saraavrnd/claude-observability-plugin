@@ -3519,7 +3519,14 @@ def build_trace_metadata(
         if isinstance(value, str) and value:
             trace_metadata[dst_key] = value
             if src_key == "cwd":
-                trace_metadata["project"] = Path(value).name
+                # BheemBhai: the launching application's project name wins over
+                # the checkout directory's basename. Every step container
+                # clones into /workspace/repo, so the cwd alone names the
+                # directory, not the project; the engine sends the real
+                # (immutable) name in CC_LANGFUSE_TRACE_METADATA. Upstream
+                # behavior is preserved when no override is set.
+                override = str((TRACE_METADATA or {}).get("project") or "").strip()
+                trace_metadata["project"] = override or Path(value).name
     return trace_metadata
 
 def is_valid_span_id_hex(span_id: Any) -> bool:

@@ -10,6 +10,7 @@ is itself a leak), and that the dict path is deep-masked."""
 import contextlib
 import hashlib
 import json
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -183,6 +184,45 @@ def test_trace_attributes_carry_the_engine_surfaces(hook_module, monkeypatch: py
         "version": "3",
         "metadata": {"exec_id": "r:s:1:1"},
     }
+
+
+# ----------------- project name: engine metadata over the checkout dir -----------------
+
+def _turn_with_cwd(hook_module: Any, cwd: str) -> Any:
+    return hook_module.Turn(
+        user_msg={"cwd": cwd, "gitBranch": "feat/x"},
+        assistant_msgs=[],
+        tool_results_by_id={},
+        tool_use_timestamps_by_id={},
+        injected_by_tool_id={},
+        rows=[],
+    )
+
+
+def test_project_name_prefers_the_engine_metadata(hook_module, monkeypatch: pytest.MonkeyPatch):
+    """Every step clones into /workspace/repo, so the cwd basename ("repo")
+    names a directory, not a BheemBhai project — the engine's immutable
+    project name wins. The cwd itself still rides along for worktree context."""
+    monkeypatch.setattr(hook_module, "TRACE_METADATA", {"project": "ExamQ"})
+    metadata = hook_module.build_trace_metadata(
+        "s1", 1, _turn_with_cwd(hook_module, "/workspace/repo"),
+        Path("s1.jsonl"), {"truncated": False, "orig_len": 10})
+    assert metadata["project"] == "ExamQ"
+    assert metadata["cwd"] == "/workspace/repo"
+    assert metadata["git_branch"] == "feat/x"
+
+
+@pytest.mark.parametrize("trace_metadata", [None, {}, {"project": ""},
+                                            {"project": "   "}])
+def test_project_name_falls_back_to_the_checkout_dir(
+        hook_module, monkeypatch: pytest.MonkeyPatch, trace_metadata):
+    """No engine override (upstream use, or a blank name) keeps the upstream
+    cwd-derived behavior — the fork must not invent a project name."""
+    monkeypatch.setattr(hook_module, "TRACE_METADATA", trace_metadata)
+    metadata = hook_module.build_trace_metadata(
+        "s1", 1, _turn_with_cwd(hook_module, "/workspace/repo"),
+        Path("s1.jsonl"), {"truncated": False, "orig_len": 10})
+    assert metadata["project"] == "repo"
 
 
 # ----------------- the propagation seam -----------------
