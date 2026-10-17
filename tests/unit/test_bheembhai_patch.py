@@ -9,6 +9,7 @@ is itself a leak), and that the dict path is deep-masked."""
 
 import contextlib
 import hashlib
+import json
 from typing import Any
 
 import pytest
@@ -220,3 +221,64 @@ def test_emit_turn_propagates_the_trace_surfaces(
     assert captured["version"] == "3"
     assert captured["metadata"] == {"exec_id": "r:s:1:1"}
     assert captured["session_id"] == "session-1"
+
+# ----------------- exit-flush budget (2026-10-17 incident) -----------------
+# A hook invocation is a short-lived process: the whole session's spans ride ONE
+# force_flush at exit. Two 5s deadlines (the join + the SDK's own default) could
+# cut it after the session state had already advanced, losing the trace with no
+# error anywhere. One knob now governs both, and a loss leaves a marker.
+
+def test_the_flush_budget_defaults_and_parses(hook_module, monkeypatch):
+    monkeypatch.delenv("CC_LANGFUSE_FLUSH_TIMEOUT_SECONDS", raising=False)
+    assert hook_module._flush_timeout_seconds() == hook_module.DEFAULT_FLUSH_TIMEOUT_SECONDS
+    monkeypatch.setenv("CC_LANGFUSE_FLUSH_TIMEOUT_SECONDS", "2.5")
+    assert hook_module._flush_timeout_seconds() == 2.5
+    for bad in ("garbage", "0", "-3"):
+        monkeypatch.setenv("CC_LANGFUSE_FLUSH_TIMEOUT_SECONDS", bad)
+        assert hook_module._flush_timeout_seconds() == hook_module.DEFAULT_FLUSH_TIMEOUT_SECONDS
+
+
+def test_a_dropped_export_leaves_a_marker(hook_module, monkeypatch, tmp_path):
+    """The trap this pins: BatchSpanProcessor.force_flush() returns True for a
+    batch it DROPPED, so the bool alone reports success on silent loss. The
+    exporter's ERROR line is the signal that actually fires."""
+    report = tmp_path / "pricing.ndjson"
+    monkeypatch.setattr(hook_module, "PRICING_REPORT_FILE", str(report))
+    monkeypatch.setenv("CC_LANGFUSE_FLUSH_TIMEOUT_SECONDS", "1")
+
+    class _Provider:
+        def force_flush(self, timeout_millis=None):
+            hook_module.logging.getLogger("opentelemetry.exporter.otlp").error(
+                "Failed to export spans batch due to timeout, max retries or shutdown."
+            )
+            return True                       # dropped, but reports success
+
+    class _Client:
+        _resources = type("R", (), {"tracer_provider": _Provider()})()
+
+        def shutdown(self):
+            pass
+
+    hook_module.flush_and_shutdown_langfuse_client(_Client())
+
+    record = json.loads(report.read_text().strip())
+    assert record == {"flush_incomplete": True, "timeout_s": 1.0}
+
+
+def test_a_clean_flush_writes_no_marker(hook_module, monkeypatch, tmp_path):
+    report = tmp_path / "pricing.ndjson"
+    monkeypatch.setattr(hook_module, "PRICING_REPORT_FILE", str(report))
+    monkeypatch.setenv("CC_LANGFUSE_FLUSH_TIMEOUT_SECONDS", "1")
+
+    class _Provider:
+        def force_flush(self, timeout_millis=None):
+            return True
+
+    class _Client:
+        _resources = type("R", (), {"tracer_provider": _Provider()})()
+
+        def shutdown(self):
+            pass
+
+    hook_module.flush_and_shutdown_langfuse_client(_Client())
+    assert not report.exists()

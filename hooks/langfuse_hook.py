@@ -37,6 +37,22 @@ def _opt(name: str) -> str:
     """
     return os.environ.get(name) or os.environ.get(f"CLAUDE_PLUGIN_OPTION_{name}") or ""
 
+
+#: BheemBhai patch: how long ONE exit export attempt may take, in seconds.
+#: Governs the SDK's OTLP export deadline (upstream default: 5s) so a long
+#: session's single exit batch has room to upload. See
+#: ``flush_and_shutdown_langfuse_client`` for why the upstream 5s is too small.
+DEFAULT_FLUSH_TIMEOUT_SECONDS = 15.0
+
+
+def _flush_timeout_seconds() -> float:
+    raw = _opt("CC_LANGFUSE_FLUSH_TIMEOUT_SECONDS").strip()
+    try:
+        value = float(raw) if raw else DEFAULT_FLUSH_TIMEOUT_SECONDS
+    except ValueError:
+        value = DEFAULT_FLUSH_TIMEOUT_SECONDS
+    return value if value > 0 else DEFAULT_FLUSH_TIMEOUT_SECONDS
+
 DEBUG = _opt("CC_LANGFUSE_DEBUG").lower() == "true"
 SKILL_TAGS = (_opt("CC_LANGFUSE_SKILL_TAGS") or "true").lower() == "true"
 CAPTURE_SKILL_CONTENT = _opt("CC_LANGFUSE_CAPTURE_SKILL_CONTENT").lower() == "true"
@@ -724,6 +740,51 @@ def write_pricing_report() -> None:
         debug(f"pricing report not written to {PRICING_REPORT_FILE}: {exc}")
 
 
+def _write_flush_incomplete_report(timeout_seconds: float) -> None:
+    """Record an exit flush that lost spans (best-effort, never raises).
+
+    Rides the pricing report file because that is the ONE channel that leaves
+    the container — a log line reaches nobody who can act on it. The record has
+    its own shape (``flush_incomplete``), so the runner filters it out of the
+    pricing aggregate and reports it as a sibling count: its presence means
+    this invocation's spans were still uploading — or were dropped by the
+    exporter — when the process exited, so Langfuse may be missing them.
+    Without it, a cut flush is indistinguishable from a run that never traced
+    at all.
+    """
+    if not PRICING_REPORT_FILE:
+        return
+    record = {"flush_incomplete": True, "timeout_s": timeout_seconds}
+    try:
+        with open(PRICING_REPORT_FILE, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, separators=(",", ":")) + "\n")
+    except Exception as exc:
+        debug(f"flush report not written to {PRICING_REPORT_FILE}: {exc}")
+
+
+class _ExportFailureWatcher(logging.Handler):
+    """BheemBhai patch: catch the SDK's own export-failure log line.
+
+    ``BatchSpanProcessor.force_flush()`` reports True once its queue has
+    drained — and a batch that FAILED to export is drained by being DROPPED, so
+    its bool cannot tell success from silent loss. The OTLP exporter logs an
+    ERROR when it gives up (``Failed to export ... batch``), so watch the
+    logging stream during the exit flush instead. Attached to the root logger
+    for the duration of the flush only.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(level=logging.ERROR)
+        self.failed = False
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            if "export" in record.getMessage().lower():
+                self.failed = True
+        except Exception:
+            pass
+
+
 # ----------------- Langfuse import (fail-open) -----------------
 # Everything above this guard runs before the SDK import and must stay
 # stdlib-only and parseable on Python 3.9 so this failure path can log.
@@ -757,6 +818,13 @@ def create_langfuse_client(config: LangfuseConfig) -> Optional[Langfuse]:
             public_key=config.public_key,
             secret_key=config.secret_key,
             host=config.host,
+            # BheemBhai patch: the SDK's default export deadline is 5 seconds
+            # (LANGFUSE_TIMEOUT), applied to both the OTLP exporter request and
+            # the batch processor's export call. A long session's single exit
+            # batch can exceed that, and the SDK then logs "Failed to export
+            # spans batch" to a stderr the CLI swallows — silent data loss.
+            # Ride the one knob the join below also uses.
+            timeout=int(_flush_timeout_seconds()),
         )
     except Exception as e:
         info(f"Langfuse client creation failed ({type(e).__name__}: {e}); tracing disabled for this turn")
@@ -3885,18 +3953,85 @@ def flush_and_shutdown_langfuse_client(langfuse: Optional[Langfuse]) -> None:
     if langfuse is None:
         return
 
-    # Cap flush+shutdown at 5s so a slow/unreachable Langfuse can't stall Claude Code.
+    # BheemBhai patch: give the exit flush a real budget (upstream capped it at
+    # 5 seconds). Each hook invocation is a SHORT-LIVED process, so the SDK's
+    # batch processor never reaches its scheduled export before we exit — a
+    # whole session's spans ride this ONE force_flush. Five seconds is enough
+    # for a small session and not for a long one: a 56-turn agentic run
+    # serializes megabytes of spans, and an exporter retry after a 429/5xx
+    # backoff can push even a modest batch past the cap. When the join times
+    # out, the daemon thread is killed at interpreter exit AFTER
+    # emit_new_turns_from_transcript already saved the session state, so the
+    # next hook (SessionEnd) sees no new rows and the trace is lost with no
+    # error anywhere (live, 2026-10-17: a 56-turn PRD run produced ZERO
+    # Langfuse observations while a 2-minute run of the same image landed).
+    # Still bounded, so a truly unreachable Langfuse cannot stall Claude Code;
+    # the budget is CC_LANGFUSE_FLUSH_TIMEOUT_SECONDS (default 15).
     try:
+        timeout = _flush_timeout_seconds()
+
+        #: True when the exporter reported unsent spans, False when it reported
+        #: a clean export, None when that answer is unavailable. A failed
+        #: export usually returns QUICKLY (the SDK retries inside its own
+        #: deadline, then drops the batch), so watching the thread alone would
+        #: miss the common silent-loss shape — only a hang keeps it alive.
+        exported: Optional[bool] = None
+        # The bool alone cannot see the drop (see _ExportFailureWatcher), so
+        # listen to the exporter's ERROR line for the duration of the flush.
+        watcher = _ExportFailureWatcher()
+        root_logger = logging.getLogger()
+        root_logger.addHandler(watcher)
+
         def _flush_and_shutdown():
+            nonlocal exported
+            # ``langfuse.flush()`` discards the tracer provider's bool, so call
+            # the provider directly when the SDK exposes it (private, hence the
+            # fallback to the public path if the shape ever drifts).
+            provider = None
             try:
-                langfuse.flush()
+                provider = getattr(
+                    getattr(langfuse, "_resources", None), "tracer_provider", None
+                )
+            except Exception:
+                provider = None
+            try:
+                if provider is not None:
+                    exported = bool(
+                        provider.force_flush(timeout_millis=int(timeout * 1000))
+                    )
+                else:
+                    langfuse.flush()
+            except Exception:
+                exported = False
+            # ``shutdown()`` flushes again on its way out; on the clean path
+            # there is nothing left to send, so it is cheap.
+            try:
+                langfuse.shutdown()
             except Exception:
                 pass
-            langfuse.shutdown()
 
         t = threading.Thread(target=_flush_and_shutdown, daemon=True)
         t.start()
-        t.join(5.0)
+        # Headroom over the SDK's own deadlines: the client was configured
+        # from the same knob, and a shutdown flush can add a SECOND such
+        # deadline. Normally both finish well inside this join.
+        t.join(2 * timeout + 5.0)
+        try:
+            root_logger.removeHandler(watcher)
+        except Exception:
+            pass
+        if t.is_alive() or exported is False or watcher.failed:
+            # Exiting now drops whatever is still queued — and nothing retries
+            # it (the session state is already advanced). Leave a mark the
+            # runner folds into the step result beside the pricing block.
+            if t.is_alive():
+                reason = f"export still running after {2 * timeout + 5.0:.0f}s"
+            elif watcher.failed:
+                reason = "exporter gave up on a batch"
+            else:
+                reason = "exporter reported spans it could not send"
+            info(f"Langfuse {reason} — exiting with spans possibly unsent")
+            _write_flush_incomplete_report(timeout)
     except Exception:
         pass
 
