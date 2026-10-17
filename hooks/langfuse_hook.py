@@ -54,6 +54,12 @@ def _flush_timeout_seconds() -> float:
     return value if value > 0 else DEFAULT_FLUSH_TIMEOUT_SECONDS
 
 DEBUG = _opt("CC_LANGFUSE_DEBUG").lower() == "true"
+# BheemBhai patch: ALSO mirror log lines into this file when set (the agent's
+# run_skill.sh points it at the step container's agent.log, which the heartbeat
+# uploads to Object Storage and the run-detail UI renders). Claude Code swallows
+# hook stdout/stderr, so without this the only copy of a tracing problem lives
+# in the container filesystem and dies with it.
+CONTAINER_LOG = _opt("CC_LANGFUSE_CONTAINER_LOG")
 SKILL_TAGS = (_opt("CC_LANGFUSE_SKILL_TAGS") or "true").lower() == "true"
 CAPTURE_SKILL_CONTENT = _opt("CC_LANGFUSE_CAPTURE_SKILL_CONTENT").lower() == "true"
 CAPTURE_IMAGES = (_opt("CC_LANGFUSE_CAPTURE_IMAGES") or "true").lower() == "true"
@@ -402,6 +408,19 @@ def _get_logger() -> Optional[logging.Logger]:
                 datefmt="%Y-%m-%d %H:%M:%S",
             ))
             lg.addHandler(h)
+            # BheemBhai patch: best-effort mirror into the step container's log.
+            # An unwritable path must never take the hook down — the rotating
+            # state log above always has the line.
+            if CONTAINER_LOG:
+                try:
+                    ch = logging.FileHandler(CONTAINER_LOG, mode="a", encoding="utf-8")
+                    ch.setFormatter(logging.Formatter(
+                        "[langfuse] %(asctime)s [%(levelname)s] %(message)s",
+                        datefmt="%Y-%m-%d %H:%M:%S",
+                    ))
+                    lg.addHandler(ch)
+                except Exception:
+                    pass
         _logger = lg
         return _logger
     except Exception:

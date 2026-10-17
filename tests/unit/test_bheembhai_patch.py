@@ -322,3 +322,54 @@ def test_a_clean_flush_writes_no_marker(hook_module, monkeypatch, tmp_path):
 
     hook_module.flush_and_shutdown_langfuse_client(_Client())
     assert not report.exists()
+
+
+# ----------------- container-log mirror (2026-10-17) -----------------
+# Claude Code swallows a hook's stdout AND stderr, so without a mirror the only
+# copy of a tracing problem dies with the container filesystem. run_skill.sh
+# points CC_LANGFUSE_CONTAINER_LOG at the step's agent.log, which the heartbeat
+# uploads to Object Storage and the run-detail UI renders (raw + parsed).
+
+def test_the_mirror_appends_prefixed_lines_to_the_container_log(hook_module, monkeypatch, tmp_path):
+    container_log = tmp_path / "agent.log"
+    container_log.write_text("pre-existing line\n")
+    monkeypatch.setattr(hook_module, "CONTAINER_LOG", str(container_log))
+
+    hook_module.info("mirrored hello")
+
+    text = container_log.read_text()
+    assert "pre-existing line" in text            # append, never truncate
+    assert "[langfuse] " in text
+    assert "mirrored hello" in text
+    # The rotating state log still gets the unprefixed line.
+    state_log = Path(hook_module.LOG_FILE).read_text()
+    assert "mirrored hello" in state_log
+    assert "[langfuse] " not in state_log
+
+
+def test_the_mirror_is_opt_in(hook_module, monkeypatch, tmp_path):
+    import logging as _logging
+
+    def handlers() -> int:
+        return len(_logging.getLogger("langfuse_hook").handlers)
+
+    monkeypatch.setattr(hook_module, "CONTAINER_LOG", "")
+    hook_module.info("one")
+    assert handlers() == 1
+
+    # Same double cache the conftest resets: module global + process registry.
+    lg = _logging.getLogger("langfuse_hook")
+    for h in list(lg.handlers):
+        lg.removeHandler(h)
+        h.close()
+    monkeypatch.setattr(hook_module, "_logger", None)
+    monkeypatch.setattr(hook_module, "CONTAINER_LOG", str(tmp_path / "agent.log"))
+    hook_module.info("two")
+    assert handlers() == 2
+
+
+def test_an_unwritable_mirror_never_takes_the_hook_down(hook_module, monkeypatch, tmp_path):
+    # A directory path makes FileHandler raise; the state log must still work.
+    monkeypatch.setattr(hook_module, "CONTAINER_LOG", str(tmp_path))
+    hook_module.info("still logged")
+    assert "still logged" in Path(hook_module.LOG_FILE).read_text()

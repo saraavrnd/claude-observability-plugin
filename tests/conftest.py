@@ -24,6 +24,8 @@ os.environ.pop("CC_LANGFUSE_STATE_DIR", None)
 os.environ.pop("CLAUDE_PLUGIN_OPTION_CC_LANGFUSE_STATE_DIR", None)
 os.environ.pop("CC_LANGFUSE_CAPTURE_IMAGES", None)
 os.environ.pop("CLAUDE_PLUGIN_OPTION_CC_LANGFUSE_CAPTURE_IMAGES", None)
+os.environ.pop("CC_LANGFUSE_CONTAINER_LOG", None)
+os.environ.pop("CLAUDE_PLUGIN_OPTION_CC_LANGFUSE_CONTAINER_LOG", None)
 
 # Mirrors OTel's active-span context: the stubbed use_span pushes the parent
 # span here so FakeOtelSpan can record which span it was started under,
@@ -233,6 +235,9 @@ def _isolated_hook_env(tmp_path: Path, hook_module: Any, monkeypatch: pytest.Mon
     monkeypatch.setattr(hook_module, "STATE_FILE", state_dir / "langfuse_state.json")
     monkeypatch.setattr(hook_module, "LOCK_FILE", state_dir / "langfuse_state.lock")
     monkeypatch.setattr(hook_module, "LOG_FILE", state_dir / "langfuse_hook.log")
+    # The container-log mirror is opt-in; a developer env var must not make
+    # every test append to a real file. Tests that exercise it set it explicitly.
+    monkeypatch.setattr(hook_module, "CONTAINER_LOG", "")
     _reset_hook_logger(hook_module)
     yield state_dir
     _reset_hook_logger(hook_module)
